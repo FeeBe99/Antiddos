@@ -5,7 +5,7 @@
 ║  Layer 1 : XDP/eBPF      — driver-level, ~100 ns                    ║
 ║  Layer 2 : iptables mangle — pre-routing scrub                       ║
 ║  Layer 3 : ipset hash:ip  — O(1) million-IP blacklist                ║
-║  Layer 4 : Application chains — flood guards & SSH brute-force       ║
+║  Layer 4 : Application chains — flood guards                         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -13,7 +13,6 @@ import argparse
 import ipaddress
 import json
 import os
-import re
 import shutil
 import signal
 import socket
@@ -23,7 +22,6 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -184,11 +182,12 @@ class DiscordNotifier:
         log("INFO", f"Discord: ICMP flood alert sent ({drops_per_sec:.0f}/s)")
 
     def alert_blacklist(self, ip: str):
-        if not self._ready("blacklist"):
+        # Her IP için ayrı cooldown key'i kullan — farklı IP'ler birbirini susturmaz
+        if not self._ready(f"blacklist:{ip}"):
             return
         self._send(self._embed(
             "🛡️ IP Blacklisted",
-            f"An IP was added to the active blacklist.",
+            "An IP was added to the active blacklist.",
             self._COLORS["blacklist"],
             [{"name": "Blocked IP", "value": f"`{ip}`", "inline": True}],
         ))
@@ -216,7 +215,7 @@ class AttackMonitor:
     def __init__(self, notifier: DiscordNotifier):
         self.notifier  = notifier
         self._stop_evt = threading.Event()
-        self._thread   = threading.Thread(target=self._loop, daemon=True, name="AttackMonitor")
+        self._thread   = threading.Thread(target=self._loop, daemon=False, name="AttackMonitor")
         self._prev: dict[str, int] = {}
 
     def start(self):
@@ -227,29 +226,6 @@ class AttackMonitor:
         self._stop_evt.set()
 
     # ── Internals ────────────────────────────────────────────────────────────
-
-    def _get_drop_counts(self) -> dict[str, int]:
-        """Read packet counts from hashlimit drop rules in iptables."""
-        counts: dict[str, int] = {}
-        r = subprocess.run(
-            "iptables -L -v -n -x 2>/dev/null",
-            shell=True, capture_output=True, text=True
-        )
-        current_chain = ""
-        for line in r.stdout.splitlines():
-            chain_match = re.match(r"^Chain (\S+)", line)
-            if chain_match:
-                current_chain = chain_match.group(1)
-            # Drop rules following a hashlimit ACCEPT always have "DROP" + "anywhere"
-            parts = line.split()
-            if len(parts) >= 4 and parts[3] == "DROP":
-                # key by chain + protocol
-                key = current_chain.lower()
-                try:
-                    counts[key] = counts.get(key, 0) + int(parts[0])
-                except ValueError:
-                    pass
-        return counts
 
     def _get_hashlimit_drops(self) -> dict[str, int]:
         """
@@ -269,8 +245,8 @@ class AttackMonitor:
                     total = 0
                     for line in p.read_text().splitlines()[1:]:  # skip header
                         cols = line.split()
-                        if len(cols) >= 4:
-                            total += int(cols[3])  # pkts column
+                        if len(cols) >= 3:
+                            total += int(cols[2])  # packets column (index 2)
                     drops[name] = total
                 except Exception:
                     drops[name] = 0
@@ -303,6 +279,10 @@ def start_attack_monitor():
     _notifier = DiscordNotifier(DISCORD_WEBHOOK_URL, cooldown=DISCORD_COOLDOWN)
     _attack_monitor = AttackMonitor(_notifier)
     _attack_monitor.start()
+    if DISCORD_WEBHOOK_URL == "YOUR_WEBHOOK_URL_HERE":
+        log("WARN", "Discord webhook URL not set — attack alerts disabled.")
+    else:
+        log("INFO", f"Discord alerts active (cooldown={DISCORD_COOLDOWN}s).")
 
 
 def stop_attack_monitor():
@@ -329,10 +309,6 @@ def run(cmd: str, check=True, capture=False) -> subprocess.CompletedProcess:
         text=True
     )
 
-def run_ok(cmd: str) -> bool:
-    r = run(cmd, check=False, capture=True)
-    return r.returncode == 0
-
 def require_root():
     if os.geteuid() != 0:
         print(f"{R}[ERROR]{NC} Must be run as root (sudo).")
@@ -344,24 +320,6 @@ def validate_ip(ip: str) -> bool:
         return True
     except ValueError:
         return False
-
-def get_ssh_client_ip() -> Optional[str]:
-    """Return the IP of the current SSH session (if any)."""
-    ssh_conn = os.environ.get("SSH_CONNECTION", "")
-    if ssh_conn:
-        parts = ssh_conn.split()
-        if parts:
-            return parts[0]
-    # Fallback: inspect /proc/net/tcp for established ssh sessions
-    try:
-        result = run("ss -tnp | grep sshd | awk '{print $5}' | head -1",
-                     capture=True, check=False)
-        ip_port = result.stdout.strip()
-        if ip_port and ":" in ip_port:
-            return ip_port.rsplit(":", 1)[0].strip("[]")
-    except Exception:
-        pass
-    return None
 
 def get_default_interface() -> str:
     result = run("ip route | grep default | awk '{print $5}' | head -1",
@@ -427,13 +385,8 @@ def compile_xdp() -> bool:
     """Compile xdp_filter.c → xdp_filter.o"""
     src = XDP_SRC
     if not src.exists():
-        # Try same dir as this script
-        alt = Path(__file__).parent / "xdp_filter.c"
-        if alt.exists():
-            src = alt
-        else:
-            log("WARN", "xdp_filter.c not found — XDP layer disabled.")
-            return False
+        log("WARN", "xdp_filter.c not found — XDP layer disabled.")
+        return False
 
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -584,8 +537,8 @@ def setup_ipset(whitelist: list[str], blacklist: list[str]):
     # Destroy & recreate
     run(f"ipset destroy {IPSET_BL} 2>/dev/null || true", check=False)
     run(f"ipset destroy {IPSET_WL} 2>/dev/null || true", check=False)
-    run(f"ipset create {IPSET_BL} hash:ip maxelem 1000000 hashsize 65536 timeout 0")
-    run(f"ipset create {IPSET_WL} hash:ip maxelem 65536  hashsize 4096   timeout 0")
+    run(f"ipset create {IPSET_BL} hash:ip maxelem 1000000 hashsize 65536 timeout 0", check=False)
+    run(f"ipset create {IPSET_WL} hash:ip maxelem 65536  hashsize 4096   timeout 0", check=False)
 
     # Populate whitelist set
     for ip in whitelist:
@@ -769,12 +722,28 @@ def apply_sysctl():
     log("INFO", f"  {G}✓{NC} sysctl hardening applied.")
 
 def restore_sysctl():
-    # Restore to conservative defaults — only the ones we changed
-    defaults = {k: "0" if v in ("1",) and "cookies" not in k and "rp_filter" not in k
-                else v for k, v in SYSCTL_SETTINGS.items()}
-    for key in ["net.ipv4.tcp_syncookies", "net.ipv4.conf.all.rp_filter",
-                "net.ipv4.conf.default.rp_filter"]:
-        run(f"sysctl -w {key}=1", check=False, capture=True)
+    """Restore only the settings we explicitly changed back to safe defaults."""
+    restore_map = {
+        "net.ipv4.tcp_syncookies":                    "1",
+        "net.ipv4.tcp_syn_retries":                   "6",
+        "net.ipv4.tcp_synack_retries":                "5",
+        "net.ipv4.tcp_max_syn_backlog":               "128",
+        "net.ipv4.conf.all.rp_filter":                "1",
+        "net.ipv4.conf.default.rp_filter":            "1",
+        "net.ipv4.icmp_echo_ignore_broadcasts":       "1",
+        "net.ipv4.icmp_ignore_bogus_error_responses": "1",
+        "net.ipv4.conf.all.accept_redirects":         "1",
+        "net.ipv4.conf.all.send_redirects":           "1",
+        "net.ipv4.conf.all.accept_source_route":      "0",
+        "net.ipv4.conf.all.log_martians":             "0",
+        "net.ipv4.tcp_rfc1337":                       "0",
+        "net.ipv4.tcp_fin_timeout":                   "60",
+        "net.ipv4.tcp_keepalive_time":                "7200",
+        "net.ipv4.tcp_keepalive_probes":              "9",
+        "net.ipv4.tcp_keepalive_intvl":               "75",
+    }
+    for key, val in restore_map.items():
+        run(f"sysctl -w {key}={val}", check=False, capture=True)
 
 # ─── Main CLI Commands ────────────────────────────────────────────────────────
 
@@ -956,6 +925,9 @@ def cmd_blacklist_add(args):
 def cmd_blacklist_remove(args):
     require_root()
     ip = args.ip
+    if not validate_ip(ip):
+        log("ERROR", f"Invalid IP address: {ip}")
+        sys.exit(1)
     if BLACKLIST_FILE.exists():
         lines = [l for l in BLACKLIST_FILE.read_text().splitlines() if l.strip() != ip]
         BLACKLIST_FILE.write_text("\n".join(lines) + "\n")
@@ -971,9 +943,6 @@ class Monitor:
 
     def __init__(self, interval: float = 1.0):
         self.interval = interval
-        self._prev_rx = 0
-        self._prev_tx = 0
-        self._prev_ts = 0.0
         self._iface   = load_state().get("interface") or get_default_interface()
         signal.signal(signal.SIGINT, self._handle_exit)
 
@@ -992,19 +961,6 @@ class Monitor:
             return rx_b, rx_p, tx_b, tx_p
         except Exception:
             return 0, 0, 0, 0
-
-    def _get_iptables_drops(self) -> dict[str, int]:
-        drops = {}
-        r = run("iptables -L INPUT -v -n 2>/dev/null", capture=True, check=False)
-        for line in r.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 4 and "DROP" in parts:
-                idx = parts.index("DROP")
-                try:
-                    drops[" ".join(parts[idx+1:idx+4])] = int(parts[0].replace("K", "000").replace("M", "000000"))
-                except (ValueError, IndexError):
-                    pass
-        return drops
 
     def _get_xdp_stats(self) -> dict[str, int]:
         """Read per-CPU counters from BPF map via bpftool."""
@@ -1049,10 +1005,10 @@ class Monitor:
             t1 = time.time()
             dt = t1 - t0 or 1
 
-            rx_bps = (rx_b1 - rx_b0) / dt
-            tx_bps = (tx_b1 - tx_b0) / dt
-            rx_pps = (rx_p1 - rx_p0) / dt
-            tx_pps = (tx_p1 - tx_p0) / dt
+            rx_bps = max(0, rx_b1 - rx_b0) / dt
+            tx_bps = max(0, tx_b1 - tx_b0) / dt
+            rx_pps = max(0, rx_p1 - rx_p0) / dt
+            tx_pps = max(0, tx_p1 - tx_p0) / dt
 
             rx_b0, rx_p0, tx_b0, tx_p0 = rx_b1, rx_p1, tx_b1, tx_p1
             t0 = t1

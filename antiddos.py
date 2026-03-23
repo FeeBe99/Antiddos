@@ -19,7 +19,9 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +34,13 @@ XDP_OBJ        = BASE_DIR / "xdp_filter.o"
 XDP_SRC        = Path(__file__).parent / "xdp_filter.c"
 STATE_FILE     = BASE_DIR / "state.json"
 LOG_FILE       = BASE_DIR / "antiddos.log"
+
+# ─── Discord Webhook ─────────────────────────────────────────────────────────
+# Paste your Discord webhook URL here:
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1485639631876653066/cE_eP2D5kxASTPSivMHkyX6shhdULX4ThmadIWdLrFBkTtS5q9yx5BefCWrZRhx-wHsr"
+
+# Cooldown in seconds between alerts of the same type (avoids spam)
+DISCORD_COOLDOWN = 60   # 1 alert per attack type per minute max
 
 # ─── Colours ──────────────────────────────────────────────────────────────────
 
@@ -58,6 +67,257 @@ def log(level: str, msg: str):
             f.write(f"[{ts}] [{level}] {msg}\n")
     except Exception:
         pass
+
+# ─── Discord Notifier ────────────────────────────────────────────────────────
+
+class DiscordNotifier:
+    """
+    Sends threshold-based attack alerts to a Discord webhook.
+    Each alert type has its own cooldown so you don't get flooded
+    with messages during a sustained attack.
+    """
+
+    # Embed colours (Discord decimal)
+    _COLORS = {
+        "syn":       0xe74c3c,   # red
+        "udp":       0xe67e22,   # orange
+        "icmp":      0xf1c40f,   # yellow
+        "blacklist": 0x9b59b6,   # purple
+    }
+
+    # Minimum drops-per-second delta to consider it an "attack"
+    # (compares two consecutive iptables snapshots 10 s apart)
+    THRESHOLDS = {
+        "syn":       50,    # SYN drops/s
+        "udp":       200,   # UDP drops/s
+        "icmp":      20,    # ICMP drops/s
+        "blacklist": 1,     # any blacklist hit counts
+    }
+
+    def __init__(self, webhook_url: str, cooldown: int = 60):
+        self.webhook_url = webhook_url
+        self.cooldown    = cooldown
+        self._last_sent: dict[str, float] = {}
+
+    # ── Internal helpers ─────────────────────────────────────────────────────
+
+    def _ready(self, key: str) -> bool:
+        """Return True if cooldown has elapsed for this alert type."""
+        now = time.time()
+        if now - self._last_sent.get(key, 0) >= self.cooldown:
+            self._last_sent[key] = now
+            return True
+        return False
+
+    def _send(self, payload: dict):
+        """Fire-and-forget POST to Discord in a daemon thread."""
+        if not self.webhook_url or self.webhook_url == "YOUR_WEBHOOK_URL_HERE":
+            return
+
+        def _post():
+            try:
+                data = json.dumps(payload).encode()
+                req  = urllib.request.Request(
+                    self.webhook_url,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=5)
+            except Exception as exc:
+                log("WARN", f"Discord webhook failed: {exc}")
+
+        t = threading.Thread(target=_post, daemon=True)
+        t.start()
+
+    def _embed(self, title: str, description: str,
+               color: int, fields: list[dict]) -> dict:
+        return {
+            "embeds": [{
+                "title":       title,
+                "description": description,
+                "color":       color,
+                "fields":      fields,
+                "footer":      {"text": "Anti-DDoS · " + time.strftime("%Y-%m-%d %H:%M:%S")},
+            }]
+        }
+
+    # ── Public alert methods ─────────────────────────────────────────────────
+
+    def alert_syn_flood(self, drops_per_sec: float, src_ip: str = ""):
+        if not self._ready("syn"):
+            return
+        fields = [{"name": "Drop rate", "value": f"`{drops_per_sec:.0f}` SYN/s", "inline": True}]
+        if src_ip:
+            fields.append({"name": "Top source", "value": f"`{src_ip}`", "inline": True})
+        self._send(self._embed(
+            "🚨 SYN Flood Detected",
+            "Incoming SYN flood is exceeding the drop threshold.",
+            self._COLORS["syn"], fields,
+        ))
+        log("INFO", f"Discord: SYN flood alert sent ({drops_per_sec:.0f}/s)")
+
+    def alert_udp_flood(self, drops_per_sec: float, src_ip: str = ""):
+        if not self._ready("udp"):
+            return
+        fields = [{"name": "Drop rate", "value": f"`{drops_per_sec:.0f}` UDP/s", "inline": True}]
+        if src_ip:
+            fields.append({"name": "Top source", "value": f"`{src_ip}`", "inline": True})
+        self._send(self._embed(
+            "🚨 UDP Flood Detected",
+            "Incoming UDP flood is exceeding the drop threshold.",
+            self._COLORS["udp"], fields,
+        ))
+        log("INFO", f"Discord: UDP flood alert sent ({drops_per_sec:.0f}/s)")
+
+    def alert_icmp_flood(self, drops_per_sec: float, src_ip: str = ""):
+        if not self._ready("icmp"):
+            return
+        fields = [{"name": "Drop rate", "value": f"`{drops_per_sec:.0f}` ICMP/s", "inline": True}]
+        if src_ip:
+            fields.append({"name": "Top source", "value": f"`{src_ip}`", "inline": True})
+        self._send(self._embed(
+            "🚨 ICMP Flood Detected",
+            "Incoming ICMP flood is exceeding the drop threshold.",
+            self._COLORS["icmp"], fields,
+        ))
+        log("INFO", f"Discord: ICMP flood alert sent ({drops_per_sec:.0f}/s)")
+
+    def alert_blacklist(self, ip: str):
+        if not self._ready("blacklist"):
+            return
+        self._send(self._embed(
+            "🛡️ IP Blacklisted",
+            f"An IP was added to the active blacklist.",
+            self._COLORS["blacklist"],
+            [{"name": "Blocked IP", "value": f"`{ip}`", "inline": True}],
+        ))
+        log("INFO", f"Discord: blacklist alert sent for {ip}")
+
+
+# ─── Attack Monitor (background thread) ──────────────────────────────────────
+
+class AttackMonitor:
+    """
+    Runs as a background daemon thread while protection is active.
+    Polls iptables drop counters every POLL_INTERVAL seconds and
+    fires Discord alerts when drops/s exceed configured thresholds.
+    """
+
+    POLL_INTERVAL = 10   # seconds between iptables snapshots
+
+    # Maps iptables chain names → notifier method + threshold key
+    CHAIN_MAP = {
+        "syn_flood":    ("syn",  "alert_syn_flood"),
+        "udp_generic":  ("udp",  "alert_udp_flood"),
+        "icmp_guard":   ("icmp", "alert_icmp_flood"),
+    }
+
+    def __init__(self, notifier: DiscordNotifier):
+        self.notifier  = notifier
+        self._stop_evt = threading.Event()
+        self._thread   = threading.Thread(target=self._loop, daemon=True, name="AttackMonitor")
+        self._prev: dict[str, int] = {}
+
+    def start(self):
+        self._thread.start()
+        log("INFO", "Attack monitor started (Discord alerts enabled).")
+
+    def stop(self):
+        self._stop_evt.set()
+
+    # ── Internals ────────────────────────────────────────────────────────────
+
+    def _get_drop_counts(self) -> dict[str, int]:
+        """Read packet counts from hashlimit drop rules in iptables."""
+        counts: dict[str, int] = {}
+        r = subprocess.run(
+            "iptables -L -v -n -x 2>/dev/null",
+            shell=True, capture_output=True, text=True
+        )
+        current_chain = ""
+        for line in r.stdout.splitlines():
+            chain_match = re.match(r"^Chain (\S+)", line)
+            if chain_match:
+                current_chain = chain_match.group(1)
+            # Drop rules following a hashlimit ACCEPT always have "DROP" + "anywhere"
+            parts = line.split()
+            if len(parts) >= 4 and parts[3] == "DROP":
+                # key by chain + protocol
+                key = current_chain.lower()
+                try:
+                    counts[key] = counts.get(key, 0) + int(parts[0])
+                except ValueError:
+                    pass
+        return counts
+
+    def _get_hashlimit_drops(self) -> dict[str, int]:
+        """
+        Read per-hashlimit-name drop counters from
+        /proc/net/ipt_hashlimit/<name> (packet count field).
+        Falls back to zero if the file isn't there.
+        """
+        drops: dict[str, int] = {}
+        base = Path("/proc/net/ipt_hashlimit")
+        if not base.exists():
+            return drops
+        for name in ["syn_flood", "ack_flood", "rst_flood",
+                     "udp_dns", "udp_generic", "icmp_guard"]:
+            p = base / name
+            if p.exists():
+                try:
+                    total = 0
+                    for line in p.read_text().splitlines()[1:]:  # skip header
+                        cols = line.split()
+                        if len(cols) >= 4:
+                            total += int(cols[3])  # pkts column
+                    drops[name] = total
+                except Exception:
+                    drops[name] = 0
+        return drops
+
+    def _loop(self):
+        while not self._stop_evt.wait(self.POLL_INTERVAL):
+            curr = self._get_hashlimit_drops()
+
+            for hl_name, (thresh_key, method_name) in self.CHAIN_MAP.items():
+                curr_val = curr.get(hl_name, 0)
+                prev_val = self._prev.get(hl_name, curr_val)
+                delta    = max(0, curr_val - prev_val)
+                dps      = delta / self.POLL_INTERVAL
+
+                threshold = DiscordNotifier.THRESHOLDS[thresh_key]
+                if dps >= threshold:
+                    getattr(self.notifier, method_name)(dps)
+
+            self._prev = curr
+
+
+# Singleton instances — created when protection starts
+_notifier: DiscordNotifier | None = None
+_attack_monitor: AttackMonitor | None = None
+
+
+def start_attack_monitor():
+    global _notifier, _attack_monitor
+    _notifier = DiscordNotifier(DISCORD_WEBHOOK_URL, cooldown=DISCORD_COOLDOWN)
+    _attack_monitor = AttackMonitor(_notifier)
+    _attack_monitor.start()
+
+
+def stop_attack_monitor():
+    global _attack_monitor
+    if _attack_monitor:
+        _attack_monitor.stop()
+        _attack_monitor = None
+        log("INFO", "Attack monitor stopped.")
+
+
+def notify_blacklist(ip: str):
+    """Call this whenever an IP is blacklisted to fire the Discord alert."""
+    if _notifier:
+        _notifier.alert_blacklist(ip)
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -566,6 +826,9 @@ def cmd_start(args):
     save_state({"running": True, "interface": iface, "xdp_mode": xdp_mode,
                 "started": time.strftime("%Y-%m-%d %H:%M:%S")})
 
+    # Start background attack monitor (Discord alerts)
+    start_attack_monitor()
+
     print(f"\n  {G}{BOLD}Anti-DDoS protection ACTIVE{NC}")
     print(f"  {'Layer':<10} {'Status':<12} {'Details'}")
     print(f"  {'─'*50}")
@@ -582,6 +845,8 @@ def cmd_stop(args):
     iface = state.get("interface") or get_default_interface()
 
     log("INFO", "Stopping Anti-DDoS protection…")
+
+    stop_attack_monitor()
 
     detach_xdp(iface)
     teardown_mangle()
@@ -681,6 +946,7 @@ def cmd_blacklist_add(args):
     with open(BLACKLIST_FILE, "a") as f:
         f.write(f"{ip}\n")
     log("INFO", f"Added {R}{ip}{NC} to blacklist.")
+    notify_blacklist(ip)
 
     state = load_state()
     if state.get("running"):

@@ -5,7 +5,7 @@
 ║  Layer 1 : XDP/eBPF      — driver-level, ~100 ns                    ║
 ║  Layer 2 : iptables mangle — pre-routing scrub                       ║
 ║  Layer 3 : ipset hash:ip  — O(1) million-IP blacklist                ║
-║  Layer 4 : Application chains — flood guards                         ║
+║  Layer 4 : Application chains — flood guards & SSH brute-force       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -13,32 +13,44 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import shutil
 import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
+from typing import Optional
+from datetime import datetime
+import threading
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
 BASE_DIR       = Path("/etc/antiddos")
 WHITELIST_FILE = BASE_DIR / "whitelist.conf"
 BLACKLIST_FILE = BASE_DIR / "blacklist.conf"
+WEBHOOK_FILE   = BASE_DIR / "webhook.conf"
 XDP_OBJ        = BASE_DIR / "xdp_filter.o"
 XDP_SRC        = Path(__file__).parent / "xdp_filter.c"
 STATE_FILE     = BASE_DIR / "state.json"
 LOG_FILE       = BASE_DIR / "antiddos.log"
 
-# ─── Discord Webhook ─────────────────────────────────────────────────────────
-# Paste your Discord webhook URL here:
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1485639631876653066/cE_eP2D5kxASTPSivMHkyX6shhdULX4ThmadIWdLrFBkTtS5q9yx5BefCWrZRhx-wHsr"
+# ─── Webhook Defaults ────────────────────────────────────────────────────────
 
-# Cooldown in seconds between alerts of the same type (avoids spam)
-DISCORD_COOLDOWN = 60   # 1 alert per attack type per minute max
+WEBHOOK_DEFAULTS = {
+    "url": "",
+    "type": "discord",           # discord, slack, generic
+    "enabled": False,
+    "alert_threshold_pps": 1000, # Alert when drops/s exceed this
+    "alert_cooldown": 60,        # Seconds between alerts (anti-spam)
+    "notify_blacklist": True,    # Alert on IP blacklist
+    "notify_start_stop": True,   # Alert on service start/stop
+    "notify_attacks": True,      # Alert on detected attacks
+    "server_name": "VPS",        # Identifier in alerts
+}
 
 # ─── Colours ──────────────────────────────────────────────────────────────────
 
@@ -66,239 +78,6 @@ def log(level: str, msg: str):
     except Exception:
         pass
 
-# ─── Discord Notifier ────────────────────────────────────────────────────────
-
-class DiscordNotifier:
-    """
-    Sends threshold-based attack alerts to a Discord webhook.
-    Each alert type has its own cooldown so you don't get flooded
-    with messages during a sustained attack.
-    """
-
-    # Embed colours (Discord decimal)
-    _COLORS = {
-        "syn":       0xe74c3c,   # red
-        "udp":       0xe67e22,   # orange
-        "icmp":      0xf1c40f,   # yellow
-        "blacklist": 0x9b59b6,   # purple
-    }
-
-    # Minimum drops-per-second delta to consider it an "attack"
-    # (compares two consecutive iptables snapshots 10 s apart)
-    THRESHOLDS = {
-        "syn":       50,    # SYN drops/s
-        "udp":       200,   # UDP drops/s
-        "icmp":      20,    # ICMP drops/s
-        "blacklist": 1,     # any blacklist hit counts
-    }
-
-    def __init__(self, webhook_url: str, cooldown: int = 60):
-        self.webhook_url = webhook_url
-        self.cooldown    = cooldown
-        self._last_sent: dict[str, float] = {}
-
-    # ── Internal helpers ─────────────────────────────────────────────────────
-
-    def _ready(self, key: str) -> bool:
-        """Return True if cooldown has elapsed for this alert type."""
-        now = time.time()
-        if now - self._last_sent.get(key, 0) >= self.cooldown:
-            self._last_sent[key] = now
-            return True
-        return False
-
-    def _send(self, payload: dict):
-        """Fire-and-forget POST to Discord in a daemon thread."""
-        if not self.webhook_url or self.webhook_url == "YOUR_WEBHOOK_URL_HERE":
-            return
-
-        def _post():
-            try:
-                data = json.dumps(payload).encode()
-                req  = urllib.request.Request(
-                    self.webhook_url,
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                urllib.request.urlopen(req, timeout=5)
-            except Exception as exc:
-                log("WARN", f"Discord webhook failed: {exc}")
-
-        t = threading.Thread(target=_post, daemon=True)
-        t.start()
-
-    def _embed(self, title: str, description: str,
-               color: int, fields: list[dict]) -> dict:
-        return {
-            "embeds": [{
-                "title":       title,
-                "description": description,
-                "color":       color,
-                "fields":      fields,
-                "footer":      {"text": "Anti-DDoS · " + time.strftime("%Y-%m-%d %H:%M:%S")},
-            }]
-        }
-
-    # ── Public alert methods ─────────────────────────────────────────────────
-
-    def alert_syn_flood(self, drops_per_sec: float, src_ip: str = ""):
-        if not self._ready("syn"):
-            return
-        fields = [{"name": "Drop rate", "value": f"`{drops_per_sec:.0f}` SYN/s", "inline": True}]
-        if src_ip:
-            fields.append({"name": "Top source", "value": f"`{src_ip}`", "inline": True})
-        self._send(self._embed(
-            "🚨 SYN Flood Detected",
-            "Incoming SYN flood is exceeding the drop threshold.",
-            self._COLORS["syn"], fields,
-        ))
-        log("INFO", f"Discord: SYN flood alert sent ({drops_per_sec:.0f}/s)")
-
-    def alert_udp_flood(self, drops_per_sec: float, src_ip: str = ""):
-        if not self._ready("udp"):
-            return
-        fields = [{"name": "Drop rate", "value": f"`{drops_per_sec:.0f}` UDP/s", "inline": True}]
-        if src_ip:
-            fields.append({"name": "Top source", "value": f"`{src_ip}`", "inline": True})
-        self._send(self._embed(
-            "🚨 UDP Flood Detected",
-            "Incoming UDP flood is exceeding the drop threshold.",
-            self._COLORS["udp"], fields,
-        ))
-        log("INFO", f"Discord: UDP flood alert sent ({drops_per_sec:.0f}/s)")
-
-    def alert_icmp_flood(self, drops_per_sec: float, src_ip: str = ""):
-        if not self._ready("icmp"):
-            return
-        fields = [{"name": "Drop rate", "value": f"`{drops_per_sec:.0f}` ICMP/s", "inline": True}]
-        if src_ip:
-            fields.append({"name": "Top source", "value": f"`{src_ip}`", "inline": True})
-        self._send(self._embed(
-            "🚨 ICMP Flood Detected",
-            "Incoming ICMP flood is exceeding the drop threshold.",
-            self._COLORS["icmp"], fields,
-        ))
-        log("INFO", f"Discord: ICMP flood alert sent ({drops_per_sec:.0f}/s)")
-
-    def alert_blacklist(self, ip: str):
-        # Her IP için ayrı cooldown key'i kullan — farklı IP'ler birbirini susturmaz
-        if not self._ready(f"blacklist:{ip}"):
-            return
-        self._send(self._embed(
-            "🛡️ IP Blacklisted",
-            "An IP was added to the active blacklist.",
-            self._COLORS["blacklist"],
-            [{"name": "Blocked IP", "value": f"`{ip}`", "inline": True}],
-        ))
-        log("INFO", f"Discord: blacklist alert sent for {ip}")
-
-
-# ─── Attack Monitor (background thread) ──────────────────────────────────────
-
-class AttackMonitor:
-    """
-    Runs as a background daemon thread while protection is active.
-    Polls iptables drop counters every POLL_INTERVAL seconds and
-    fires Discord alerts when drops/s exceed configured thresholds.
-    """
-
-    POLL_INTERVAL = 10   # seconds between iptables snapshots
-
-    # Maps iptables chain names → notifier method + threshold key
-    CHAIN_MAP = {
-        "syn_flood":    ("syn",  "alert_syn_flood"),
-        "udp_generic":  ("udp",  "alert_udp_flood"),
-        "icmp_guard":   ("icmp", "alert_icmp_flood"),
-    }
-
-    def __init__(self, notifier: DiscordNotifier):
-        self.notifier  = notifier
-        self._stop_evt = threading.Event()
-        self._thread   = threading.Thread(target=self._loop, daemon=False, name="AttackMonitor")
-        self._prev: dict[str, int] = {}
-
-    def start(self):
-        self._thread.start()
-        log("INFO", "Attack monitor started (Discord alerts enabled).")
-
-    def stop(self):
-        self._stop_evt.set()
-
-    # ── Internals ────────────────────────────────────────────────────────────
-
-    def _get_hashlimit_drops(self) -> dict[str, int]:
-        """
-        Read per-hashlimit-name drop counters from
-        /proc/net/ipt_hashlimit/<name> (packet count field).
-        Falls back to zero if the file isn't there.
-        """
-        drops: dict[str, int] = {}
-        base = Path("/proc/net/ipt_hashlimit")
-        if not base.exists():
-            return drops
-        for name in ["syn_flood", "ack_flood", "rst_flood",
-                     "udp_dns", "udp_generic", "icmp_guard"]:
-            p = base / name
-            if p.exists():
-                try:
-                    total = 0
-                    for line in p.read_text().splitlines()[1:]:  # skip header
-                        cols = line.split()
-                        if len(cols) >= 3:
-                            total += int(cols[2])  # packets column (index 2)
-                    drops[name] = total
-                except Exception:
-                    drops[name] = 0
-        return drops
-
-    def _loop(self):
-        while not self._stop_evt.wait(self.POLL_INTERVAL):
-            curr = self._get_hashlimit_drops()
-
-            for hl_name, (thresh_key, method_name) in self.CHAIN_MAP.items():
-                curr_val = curr.get(hl_name, 0)
-                prev_val = self._prev.get(hl_name, curr_val)
-                delta    = max(0, curr_val - prev_val)
-                dps      = delta / self.POLL_INTERVAL
-
-                threshold = DiscordNotifier.THRESHOLDS[thresh_key]
-                if dps >= threshold:
-                    getattr(self.notifier, method_name)(dps)
-
-            self._prev = curr
-
-
-# Singleton instances — created when protection starts
-_notifier: DiscordNotifier | None = None
-_attack_monitor: AttackMonitor | None = None
-
-
-def start_attack_monitor():
-    global _notifier, _attack_monitor
-    _notifier = DiscordNotifier(DISCORD_WEBHOOK_URL, cooldown=DISCORD_COOLDOWN)
-    _attack_monitor = AttackMonitor(_notifier)
-    _attack_monitor.start()
-    if DISCORD_WEBHOOK_URL == "YOUR_WEBHOOK_URL_HERE":
-        log("WARN", "Discord webhook URL not set — attack alerts disabled.")
-    else:
-        log("INFO", f"Discord alerts active (cooldown={DISCORD_COOLDOWN}s).")
-
-
-def stop_attack_monitor():
-    global _attack_monitor
-    if _attack_monitor:
-        _attack_monitor.stop()
-        _attack_monitor = None
-        log("INFO", "Attack monitor stopped.")
-
-
-def notify_blacklist(ip: str):
-    """Call this whenever an IP is blacklisted to fire the Discord alert."""
-    if _notifier:
-        _notifier.alert_blacklist(ip)
-
-
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def run(cmd: str, check=True, capture=False) -> subprocess.CompletedProcess:
@@ -308,6 +87,10 @@ def run(cmd: str, check=True, capture=False) -> subprocess.CompletedProcess:
         stderr=subprocess.PIPE if capture else None,
         text=True
     )
+
+def run_ok(cmd: str) -> bool:
+    r = run(cmd, check=False, capture=True)
+    return r.returncode == 0
 
 def require_root():
     if os.geteuid() != 0:
@@ -320,6 +103,24 @@ def validate_ip(ip: str) -> bool:
         return True
     except ValueError:
         return False
+
+def get_ssh_client_ip() -> Optional[str]:
+    """Return the IP of the current SSH session (if any)."""
+    ssh_conn = os.environ.get("SSH_CONNECTION", "")
+    if ssh_conn:
+        parts = ssh_conn.split()
+        if parts:
+            return parts[0]
+    # Fallback: inspect /proc/net/tcp for established ssh sessions
+    try:
+        result = run("ss -tnp | grep sshd | awk '{print $5}' | head -1",
+                     capture=True, check=False)
+        ip_port = result.stdout.strip()
+        if ip_port and ":" in ip_port:
+            return ip_port.rsplit(":", 1)[0].strip("[]")
+    except Exception:
+        pass
+    return None
 
 def get_default_interface() -> str:
     result = run("ip route | grep default | awk '{print $5}' | head -1",
@@ -355,6 +156,198 @@ def load_state() -> dict:
             pass
     return {"running": False, "interface": "", "xdp_mode": ""}
 
+# ─── Webhook System ──────────────────────────────────────────────────────────
+
+_last_alert_time = 0
+_alert_lock = threading.Lock()
+
+def load_webhook_config() -> dict:
+    """Load webhook configuration from file."""
+    config = WEBHOOK_DEFAULTS.copy()
+    if WEBHOOK_FILE.exists():
+        try:
+            saved = json.loads(WEBHOOK_FILE.read_text())
+            config.update(saved)
+        except Exception:
+            pass
+    return config
+
+def save_webhook_config(config: dict):
+    """Save webhook configuration to file."""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    WEBHOOK_FILE.write_text(json.dumps(config, indent=2))
+
+def send_webhook_alert(
+    title: str,
+    description: str,
+    color: str = "red",
+    fields: list = None,
+    force: bool = False
+):
+    """
+    Send alert to configured webhook (Discord/Slack/Generic).
+    
+    Args:
+        title: Alert title
+        description: Alert message
+        color: red, orange, green, blue
+        fields: List of {"name": "...", "value": "..."} dicts
+        force: Bypass cooldown (for test alerts)
+    """
+    global _last_alert_time
+    
+    config = load_webhook_config()
+    
+    if not config.get("enabled") or not config.get("url"):
+        return False
+    
+    # Cooldown check (anti-spam)
+    with _alert_lock:
+        now = time.time()
+        cooldown = config.get("alert_cooldown", 60)
+        if not force and (now - _last_alert_time) < cooldown:
+            return False
+        _last_alert_time = now
+    
+    url = config["url"]
+    webhook_type = config.get("type", "discord")
+    server_name = config.get("server_name", "VPS")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Color mapping
+    colors = {
+        "red": 0xFF4444,
+        "orange": 0xFFA500,
+        "green": 0x44FF44,
+        "blue": 0x4444FF,
+    }
+    color_int = colors.get(color, colors["red"])
+    
+    try:
+        if webhook_type == "discord":
+            payload = _build_discord_payload(
+                title, description, color_int, fields, server_name, timestamp
+            )
+        elif webhook_type == "slack":
+            payload = _build_slack_payload(
+                title, description, color, fields, server_name, timestamp
+            )
+        else:  # generic
+            payload = _build_generic_payload(
+                title, description, color, fields, server_name, timestamp
+            )
+        
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json", "User-Agent": "AntiDDoS/2.0"}
+        )
+        
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status in (200, 204)
+            
+    except Exception as e:
+        log("WARN", f"Webhook failed: {e}")
+        return False
+
+def _build_discord_payload(title, desc, color, fields, server, ts):
+    embed = {
+        "title": f"🛡️ {title}",
+        "description": desc,
+        "color": color,
+        "footer": {"text": f"{server} • {ts}"},
+        "fields": []
+    }
+    if fields:
+        for f in fields:
+            embed["fields"].append({
+                "name": f.get("name", ""),
+                "value": f.get("value", ""),
+                "inline": f.get("inline", True)
+            })
+    return {"embeds": [embed]}
+
+def _build_slack_payload(title, desc, color, fields, server, ts):
+    color_map = {"red": "danger", "orange": "warning", "green": "good", "blue": "#4444FF"}
+    attachment = {
+        "fallback": f"{title}: {desc}",
+        "color": color_map.get(color, color),
+        "title": f"🛡️ {title}",
+        "text": desc,
+        "footer": f"{server} • {ts}",
+        "fields": []
+    }
+    if fields:
+        for f in fields:
+            attachment["fields"].append({
+                "title": f.get("name", ""),
+                "value": f.get("value", ""),
+                "short": f.get("inline", True)
+            })
+    return {"attachments": [attachment]}
+
+def _build_generic_payload(title, desc, color, fields, server, ts):
+    return {
+        "event": "antiddos_alert",
+        "title": title,
+        "description": desc,
+        "severity": color,
+        "server": server,
+        "timestamp": ts,
+        "fields": fields or []
+    }
+
+def alert_attack_detected(pps: float, drop_type: str, details: str = ""):
+    """Send alert for detected attack."""
+    config = load_webhook_config()
+    if not config.get("notify_attacks", True):
+        return
+    
+    send_webhook_alert(
+        title="⚠️ Attack Detected!",
+        description=f"High packet drop rate detected: **{pps:,.0f} drops/sec**",
+        color="red",
+        fields=[
+            {"name": "Type", "value": drop_type, "inline": True},
+            {"name": "Rate", "value": f"{pps:,.0f}/s", "inline": True},
+            {"name": "Details", "value": details or "Automatic mitigation active", "inline": False},
+        ]
+    )
+
+def alert_ip_blocked(ip: str, reason: str = "Manual"):
+    """Send alert when IP is blacklisted."""
+    config = load_webhook_config()
+    if not config.get("notify_blacklist", True):
+        return
+    
+    send_webhook_alert(
+        title="🚫 IP Blocked",
+        description=f"IP address added to blacklist",
+        color="orange",
+        fields=[
+            {"name": "IP Address", "value": f"`{ip}`", "inline": True},
+            {"name": "Reason", "value": reason, "inline": True},
+        ]
+    )
+
+def alert_service_status(status: str, details: str = ""):
+    """Send alert on service start/stop."""
+    config = load_webhook_config()
+    if not config.get("notify_start_stop", True):
+        return
+    
+    is_start = status.lower() == "started"
+    send_webhook_alert(
+        title="✅ Protection Started" if is_start else "⛔ Protection Stopped",
+        description=f"Anti-DDoS protection has been {status.lower()}",
+        color="green" if is_start else "red",
+        fields=[
+            {"name": "Status", "value": status, "inline": True},
+            {"name": "Details", "value": details or "All layers active" if is_start else "Server unprotected", "inline": True},
+        ]
+    )
+
 # ─── Dependency Checks ────────────────────────────────────────────────────────
 
 REQUIRED_TOOLS = {
@@ -385,8 +378,13 @@ def compile_xdp() -> bool:
     """Compile xdp_filter.c → xdp_filter.o"""
     src = XDP_SRC
     if not src.exists():
-        log("WARN", "xdp_filter.c not found — XDP layer disabled.")
-        return False
+        # Try same dir as this script
+        alt = Path(__file__).parent / "xdp_filter.c"
+        if alt.exists():
+            src = alt
+        else:
+            log("WARN", "xdp_filter.c not found — XDP layer disabled.")
+            return False
 
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -537,8 +535,8 @@ def setup_ipset(whitelist: list[str], blacklist: list[str]):
     # Destroy & recreate
     run(f"ipset destroy {IPSET_BL} 2>/dev/null || true", check=False)
     run(f"ipset destroy {IPSET_WL} 2>/dev/null || true", check=False)
-    run(f"ipset create {IPSET_BL} hash:ip maxelem 1000000 hashsize 65536 timeout 0", check=False)
-    run(f"ipset create {IPSET_WL} hash:ip maxelem 65536  hashsize 4096   timeout 0", check=False)
+    run(f"ipset create {IPSET_BL} hash:ip maxelem 1000000 hashsize 65536 timeout 0")
+    run(f"ipset create {IPSET_WL} hash:ip maxelem 65536  hashsize 4096   timeout 0")
 
     # Populate whitelist set
     for ip in whitelist:
@@ -722,28 +720,12 @@ def apply_sysctl():
     log("INFO", f"  {G}✓{NC} sysctl hardening applied.")
 
 def restore_sysctl():
-    """Restore only the settings we explicitly changed back to safe defaults."""
-    restore_map = {
-        "net.ipv4.tcp_syncookies":                    "1",
-        "net.ipv4.tcp_syn_retries":                   "6",
-        "net.ipv4.tcp_synack_retries":                "5",
-        "net.ipv4.tcp_max_syn_backlog":               "128",
-        "net.ipv4.conf.all.rp_filter":                "1",
-        "net.ipv4.conf.default.rp_filter":            "1",
-        "net.ipv4.icmp_echo_ignore_broadcasts":       "1",
-        "net.ipv4.icmp_ignore_bogus_error_responses": "1",
-        "net.ipv4.conf.all.accept_redirects":         "1",
-        "net.ipv4.conf.all.send_redirects":           "1",
-        "net.ipv4.conf.all.accept_source_route":      "0",
-        "net.ipv4.conf.all.log_martians":             "0",
-        "net.ipv4.tcp_rfc1337":                       "0",
-        "net.ipv4.tcp_fin_timeout":                   "60",
-        "net.ipv4.tcp_keepalive_time":                "7200",
-        "net.ipv4.tcp_keepalive_probes":              "9",
-        "net.ipv4.tcp_keepalive_intvl":               "75",
-    }
-    for key, val in restore_map.items():
-        run(f"sysctl -w {key}={val}", check=False, capture=True)
+    # Restore to conservative defaults — only the ones we changed
+    defaults = {k: "0" if v in ("1",) and "cookies" not in k and "rp_filter" not in k
+                else v for k, v in SYSCTL_SETTINGS.items()}
+    for key in ["net.ipv4.tcp_syncookies", "net.ipv4.conf.all.rp_filter",
+                "net.ipv4.conf.default.rp_filter"]:
+        run(f"sysctl -w {key}=1", check=False, capture=True)
 
 # ─── Main CLI Commands ────────────────────────────────────────────────────────
 
@@ -763,6 +745,14 @@ def cmd_start(args):
         WHITELIST_FILE.write_text("# Anti-DDoS Whitelist — one IP per line\n")
     if not BLACKLIST_FILE.exists():
         BLACKLIST_FILE.write_text("# Anti-DDoS Blacklist — one IP per line\n")
+
+    # Safety: auto-whitelist current SSH session IP
+    ssh_ip = get_ssh_client_ip()
+    if ssh_ip:
+        whitelist_add_ip(ssh_ip, silent=True)
+        log("INFO", f"Auto-whitelisted SSH session IP: {C}{ssh_ip}{NC}")
+    else:
+        log("WARN", "Could not detect SSH session IP — ensure your IP is in whitelist.conf.")
 
     iface = getattr(args, "interface", None) or get_default_interface()
     log("INFO", f"Using network interface: {C}{iface}{NC}")
@@ -795,9 +785,6 @@ def cmd_start(args):
     save_state({"running": True, "interface": iface, "xdp_mode": xdp_mode,
                 "started": time.strftime("%Y-%m-%d %H:%M:%S")})
 
-    # Start background attack monitor (Discord alerts)
-    start_attack_monitor()
-
     print(f"\n  {G}{BOLD}Anti-DDoS protection ACTIVE{NC}")
     print(f"  {'Layer':<10} {'Status':<12} {'Details'}")
     print(f"  {'─'*50}")
@@ -807,6 +794,9 @@ def cmd_start(args):
     print(f"  {'ipset':<10} {G}✓ ACTIVE{NC:<30} O(1) IP blacklist ({len(blacklist)} IPs)")
     print(f"  {'Chains':<10} {G}✓ ACTIVE{NC:<30} flood/brute-force guards")
     print()
+    
+    # Send webhook notification
+    alert_service_status("Started", f"XDP: {xdp_mode or 'disabled'}, Interface: {iface}")
 
 def cmd_stop(args):
     require_root()
@@ -814,8 +804,6 @@ def cmd_stop(args):
     iface = state.get("interface") or get_default_interface()
 
     log("INFO", "Stopping Anti-DDoS protection…")
-
-    stop_attack_monitor()
 
     detach_xdp(iface)
     teardown_mangle()
@@ -825,6 +813,9 @@ def cmd_stop(args):
 
     save_state({"running": False, "interface": "", "xdp_mode": ""})
     log("INFO", f"{G}All layers deactivated. Server is unprotected.{NC}")
+    
+    # Send webhook notification
+    alert_service_status("Stopped", "All protection layers deactivated")
 
 def cmd_status(args):
     state = load_state()
@@ -915,19 +906,18 @@ def cmd_blacklist_add(args):
     with open(BLACKLIST_FILE, "a") as f:
         f.write(f"{ip}\n")
     log("INFO", f"Added {R}{ip}{NC} to blacklist.")
-    notify_blacklist(ip)
 
     state = load_state()
     if state.get("running"):
         run(f"ipset add {IPSET_BL} {ip} 2>/dev/null || true", check=False)
         log("INFO", "Live-updated running ipset.")
+    
+    # Send webhook notification
+    alert_ip_blocked(ip, "Manual blacklist")
 
 def cmd_blacklist_remove(args):
     require_root()
     ip = args.ip
-    if not validate_ip(ip):
-        log("ERROR", f"Invalid IP address: {ip}")
-        sys.exit(1)
     if BLACKLIST_FILE.exists():
         lines = [l for l in BLACKLIST_FILE.read_text().splitlines() if l.strip() != ip]
         BLACKLIST_FILE.write_text("\n".join(lines) + "\n")
@@ -943,12 +933,51 @@ class Monitor:
 
     def __init__(self, interval: float = 1.0):
         self.interval = interval
+        self._prev_rx = 0
+        self._prev_tx = 0
+        self._prev_ts = 0.0
         self._iface   = load_state().get("interface") or get_default_interface()
         signal.signal(signal.SIGINT, self._handle_exit)
+        
+        # Attack detection state
+        self._prev_xdp_stats = {"bl_drops": 0, "flag_drops": 0, "frag_drops": 0, "total": 0}
+        self._webhook_config = load_webhook_config()
 
     def _handle_exit(self, *_):
         print(f"\n\n  {Y}Monitor stopped.{NC}\n")
         sys.exit(0)
+
+    def _check_attack_threshold(self, current_xdp: dict, dt: float):
+        """Check if drop rate exceeds threshold and send alert."""
+        if not self._webhook_config.get("enabled"):
+            return
+        
+        threshold = self._webhook_config.get("alert_threshold_pps", 1000)
+        
+        # Calculate drops per second
+        bl_dps = (current_xdp["bl_drops"] - self._prev_xdp_stats["bl_drops"]) / dt
+        flag_dps = (current_xdp["flag_drops"] - self._prev_xdp_stats["flag_drops"]) / dt
+        frag_dps = (current_xdp["frag_drops"] - self._prev_xdp_stats["frag_drops"]) / dt
+        
+        total_dps = bl_dps + flag_dps + frag_dps
+        
+        if total_dps >= threshold:
+            # Determine attack type
+            if bl_dps > flag_dps and bl_dps > frag_dps:
+                attack_type = "Blacklisted IP flood"
+            elif flag_dps > frag_dps:
+                attack_type = "TCP flag attack (NULL/XMAS/SYN+FIN)"
+            else:
+                attack_type = "Fragment attack"
+            
+            alert_attack_detected(
+                pps=total_dps,
+                drop_type=attack_type,
+                details=f"BL: {bl_dps:.0f}/s, Flags: {flag_dps:.0f}/s, Frag: {frag_dps:.0f}/s"
+            )
+        
+        # Update previous stats
+        self._prev_xdp_stats = current_xdp.copy()
 
     def _read_net_stats(self) -> tuple[int, int, int, int]:
         """Returns (rx_bytes, rx_packets, tx_bytes, tx_packets)."""
@@ -961,6 +990,19 @@ class Monitor:
             return rx_b, rx_p, tx_b, tx_p
         except Exception:
             return 0, 0, 0, 0
+
+    def _get_iptables_drops(self) -> dict[str, int]:
+        drops = {}
+        r = run("iptables -L INPUT -v -n 2>/dev/null", capture=True, check=False)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and "DROP" in parts:
+                idx = parts.index("DROP")
+                try:
+                    drops[" ".join(parts[idx+1:idx+4])] = int(parts[0].replace("K", "000").replace("M", "000000"))
+                except (ValueError, IndexError):
+                    pass
+        return drops
 
     def _get_xdp_stats(self) -> dict[str, int]:
         """Read per-CPU counters from BPF map via bpftool."""
@@ -1005,16 +1047,19 @@ class Monitor:
             t1 = time.time()
             dt = t1 - t0 or 1
 
-            rx_bps = max(0, rx_b1 - rx_b0) / dt
-            tx_bps = max(0, tx_b1 - tx_b0) / dt
-            rx_pps = max(0, rx_p1 - rx_p0) / dt
-            tx_pps = max(0, tx_p1 - tx_p0) / dt
+            rx_bps = (rx_b1 - rx_b0) / dt
+            tx_bps = (tx_b1 - tx_b0) / dt
+            rx_pps = (rx_p1 - rx_p0) / dt
+            tx_pps = (tx_p1 - tx_p0) / dt
 
             rx_b0, rx_p0, tx_b0, tx_p0 = rx_b1, rx_p1, tx_b1, tx_p1
             t0 = t1
 
             xdp   = self._get_xdp_stats()
             bl_ips = self._get_blocked_ips(8)
+            
+            # Check for attacks and send webhook alerts
+            self._check_attack_threshold(xdp, dt)
 
             ts = time.strftime("%H:%M:%S")
             print(self.CLEAR, end="")
@@ -1068,6 +1113,12 @@ Examples:
   sudo python3 antiddos.py --blacklist-add 5.6.7.8
   sudo python3 antiddos.py --blacklist-remove 5.6.7.8
   sudo python3 antiddos.py --check-deps
+  
+  # Webhook commands
+  sudo python3 antiddos.py --webhook-set URL [--webhook-type discord|slack|generic]
+  sudo python3 antiddos.py --webhook-test
+  sudo python3 antiddos.py --webhook-status
+  sudo python3 antiddos.py --webhook-disable
 """
     )
 
@@ -1083,9 +1134,105 @@ Examples:
     p.add_argument("--no-xdp",          action="store_true", help="Skip Layer 1 XDP (iptables only)")
     p.add_argument("--interval",         metavar="SEC",       type=float, default=1.0,
                    help="Monitor refresh interval in seconds (default: 1)")
+    
+    # Webhook arguments
+    p.add_argument("--webhook-set",      metavar="URL",       help="Set webhook URL (Discord/Slack/Generic)")
+    p.add_argument("--webhook-type",     metavar="TYPE",      default="discord",
+                   choices=["discord", "slack", "generic"],
+                   help="Webhook type: discord, slack, generic (default: discord)")
+    p.add_argument("--webhook-test",     action="store_true", help="Send a test webhook alert")
+    p.add_argument("--webhook-status",   action="store_true", help="Show webhook configuration")
+    p.add_argument("--webhook-disable",  action="store_true", help="Disable webhook notifications")
+    p.add_argument("--webhook-threshold", metavar="PPS", type=int,
+                   help="Set attack alert threshold (drops/sec, default: 1000)")
+    p.add_argument("--server-name",      metavar="NAME",      help="Server name for webhook alerts")
     return p
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
+
+def cmd_webhook_set(args):
+    """Configure webhook URL and settings."""
+    require_root()
+    config = load_webhook_config()
+    
+    config["url"] = args.webhook_set
+    config["type"] = args.webhook_type
+    config["enabled"] = True
+    
+    if args.server_name:
+        config["server_name"] = args.server_name
+    if args.webhook_threshold:
+        config["alert_threshold_pps"] = args.webhook_threshold
+    
+    save_webhook_config(config)
+    
+    log("INFO", f"Webhook configured:")
+    print(f"  URL:       {C}{config['url'][:50]}...{NC}" if len(config['url']) > 50 else f"  URL:       {C}{config['url']}{NC}")
+    print(f"  Type:      {config['type']}")
+    print(f"  Server:    {config['server_name']}")
+    print(f"  Threshold: {config['alert_threshold_pps']} drops/s")
+    print(f"  Status:    {G}ENABLED{NC}")
+    print(f"\n  Test with: {DIM}sudo antiddos --webhook-test{NC}")
+
+def cmd_webhook_test(args):
+    """Send a test webhook alert."""
+    config = load_webhook_config()
+    
+    if not config.get("url"):
+        log("ERROR", "No webhook URL configured. Use --webhook-set URL first.")
+        sys.exit(1)
+    
+    log("INFO", "Sending test webhook alert...")
+    
+    success = send_webhook_alert(
+        title="🧪 Test Alert",
+        description="This is a test notification from your Anti-DDoS system.",
+        color="blue",
+        fields=[
+            {"name": "Status", "value": "Test successful", "inline": True},
+            {"name": "Server", "value": config.get("server_name", "VPS"), "inline": True},
+        ],
+        force=True
+    )
+    
+    if success:
+        log("INFO", f"{G}✓ Test webhook sent successfully!{NC}")
+    else:
+        log("ERROR", f"{R}✗ Webhook failed. Check URL and connectivity.{NC}")
+
+def cmd_webhook_status(args):
+    """Display webhook configuration."""
+    config = load_webhook_config()
+    
+    print(f"\n  {B}{BOLD}Webhook Configuration{NC}\n")
+    
+    status = f"{G}ENABLED{NC}" if config.get("enabled") and config.get("url") else f"{R}DISABLED{NC}"
+    print(f"  Status:         {status}")
+    
+    if config.get("url"):
+        url_display = config['url'][:50] + "..." if len(config['url']) > 50 else config['url']
+        print(f"  URL:            {C}{url_display}{NC}")
+    else:
+        print(f"  URL:            {DIM}(not set){NC}")
+    
+    print(f"  Type:           {config.get('type', 'discord')}")
+    print(f"  Server Name:    {config.get('server_name', 'VPS')}")
+    print(f"  Alert Threshold: {config.get('alert_threshold_pps', 1000)} drops/s")
+    print(f"  Alert Cooldown: {config.get('alert_cooldown', 60)}s")
+    print()
+    print(f"  {BOLD}Notifications:{NC}")
+    print(f"    Start/Stop:   {'✓' if config.get('notify_start_stop', True) else '✗'}")
+    print(f"    Attacks:      {'✓' if config.get('notify_attacks', True) else '✗'}")
+    print(f"    IP Blacklist: {'✓' if config.get('notify_blacklist', True) else '✗'}")
+    print()
+
+def cmd_webhook_disable(args):
+    """Disable webhook notifications."""
+    require_root()
+    config = load_webhook_config()
+    config["enabled"] = False
+    save_webhook_config(config)
+    log("INFO", f"Webhook notifications {R}DISABLED{NC}")
 
 def main():
     parser = build_parser()
@@ -1113,6 +1260,14 @@ def main():
         cmd_blacklist_remove(args)
     elif args.check_deps:
         check_dependencies()
+    elif args.webhook_set:
+        cmd_webhook_set(args)
+    elif args.webhook_test:
+        cmd_webhook_test(args)
+    elif args.webhook_status:
+        cmd_webhook_status(args)
+    elif args.webhook_disable:
+        cmd_webhook_disable(args)
     else:
         parser.print_help()
 

@@ -5,7 +5,7 @@
 ║  Layer 1 : XDP/eBPF      — driver-level, ~100 ns                    ║
 ║  Layer 2 : iptables mangle — pre-routing scrub                       ║
 ║  Layer 3 : ipset hash:ip  — O(1) million-IP blacklist                ║
-║  Layer 4 : Application chains — flood guards & SSH brute-force       ║
+║  Layer 4 : Application chains — flood guards                         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -13,7 +13,6 @@ import argparse
 import ipaddress
 import json
 import os
-import re
 import shutil
 import signal
 import socket
@@ -21,7 +20,6 @@ import subprocess
 import sys
 import time
 import urllib.request
-import urllib.error
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -88,10 +86,6 @@ def run(cmd: str, check=True, capture=False) -> subprocess.CompletedProcess:
         text=True
     )
 
-def run_ok(cmd: str) -> bool:
-    r = run(cmd, check=False, capture=True)
-    return r.returncode == 0
-
 def require_root():
     if os.geteuid() != 0:
         print(f"{R}[ERROR]{NC} Must be run as root (sudo).")
@@ -100,6 +94,11 @@ def require_root():
 def validate_ip(ip: str) -> bool:
     try:
         ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        pass
+    try:
+        ipaddress.ip_network(ip, strict=False)
         return True
     except ValueError:
         return False
@@ -344,7 +343,7 @@ def alert_service_status(status: str, details: str = ""):
         color="green" if is_start else "red",
         fields=[
             {"name": "Status", "value": status, "inline": True},
-            {"name": "Details", "value": details or "All layers active" if is_start else "Server unprotected", "inline": True},
+            {"name": "Details", "value": (details or "All layers active") if is_start else (details or "Server unprotected"), "inline": True},
         ]
     )
 
@@ -378,13 +377,8 @@ def compile_xdp() -> bool:
     """Compile xdp_filter.c → xdp_filter.o"""
     src = XDP_SRC
     if not src.exists():
-        # Try same dir as this script
-        alt = Path(__file__).parent / "xdp_filter.c"
-        if alt.exists():
-            src = alt
-        else:
-            log("WARN", "xdp_filter.c not found — XDP layer disabled.")
-            return False
+        log("WARN", "xdp_filter.c not found — XDP layer disabled.")
+        return False
 
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -535,8 +529,8 @@ def setup_ipset(whitelist: list[str], blacklist: list[str]):
     # Destroy & recreate
     run(f"ipset destroy {IPSET_BL} 2>/dev/null || true", check=False)
     run(f"ipset destroy {IPSET_WL} 2>/dev/null || true", check=False)
-    run(f"ipset create {IPSET_BL} hash:ip maxelem 1000000 hashsize 65536 timeout 0")
-    run(f"ipset create {IPSET_WL} hash:ip maxelem 65536  hashsize 4096   timeout 0")
+    run(f"ipset create {IPSET_BL} hash:ip maxelem 1000000 hashsize 65536 timeout 0", check=False)
+    run(f"ipset create {IPSET_WL} hash:ip maxelem 65536  hashsize 4096   timeout 0", check=False)
 
     # Populate whitelist set
     for ip in whitelist:
@@ -682,6 +676,18 @@ def teardown_application_chains():
     def ipt(cmd):
         run(f"iptables {cmd}", check=False)
 
+    # Remove explicit INPUT rules added at startup
+    ipt("-D INPUT -p tcp --dport 22    -j ACCEPT 2>/dev/null || true")
+    for port in ["80", "443", "20080"]:
+        ipt(f"-D INPUT -p tcp --dport {port} -j ACCEPT 2>/dev/null || true")
+    for port in ["22126", "22129", "22132", "22135", "22138", "22141", "22144", "22153"]:
+        ipt(f"-D INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null || true")
+    for port in ["22003", "22006", "22009", "22012", "22015", "22018", "22021", "22030"]:
+        ipt(f"-D INPUT -p udp --dport {port} -j ACCEPT 2>/dev/null || true")
+    for port in ["22006", "22009", "22012", "22015", "22018", "22021", "22024", "22033"]:
+        ipt(f"-D INPUT -p tcp --dport {port} -j ACCEPT 2>/dev/null || true")
+
+    # Remove chain jumps and destroy custom chains
     for chain in ["TCP_FLOOD", "UDP_FLOOD", "ICMP_GUARD"]:
         ipt(f"-D INPUT -p tcp  -j {chain} 2>/dev/null || true")
         ipt(f"-D INPUT -p udp  -j {chain} 2>/dev/null || true")
@@ -720,12 +726,29 @@ def apply_sysctl():
     log("INFO", f"  {G}✓{NC} sysctl hardening applied.")
 
 def restore_sysctl():
-    # Restore to conservative defaults — only the ones we changed
-    defaults = {k: "0" if v in ("1",) and "cookies" not in k and "rp_filter" not in k
-                else v for k, v in SYSCTL_SETTINGS.items()}
-    for key in ["net.ipv4.tcp_syncookies", "net.ipv4.conf.all.rp_filter",
-                "net.ipv4.conf.default.rp_filter"]:
-        run(f"sysctl -w {key}=1", check=False, capture=True)
+    # Restore all changed settings back to kernel defaults
+    restore_map = {
+        "net.ipv4.tcp_syncookies":                    "1",
+        "net.ipv4.tcp_syn_retries":                   "6",
+        "net.ipv4.tcp_synack_retries":                "5",
+        "net.ipv4.tcp_max_syn_backlog":               "128",
+        "net.ipv4.conf.all.rp_filter":                "1",
+        "net.ipv4.conf.default.rp_filter":            "1",
+        "net.ipv4.icmp_echo_ignore_broadcasts":       "1",
+        "net.ipv4.icmp_ignore_bogus_error_responses": "1",
+        "net.ipv4.conf.all.accept_redirects":         "1",
+        "net.ipv4.conf.all.send_redirects":           "1",
+        "net.ipv4.conf.all.accept_source_route":      "0",
+        "net.ipv4.conf.all.log_martians":             "0",
+        "net.ipv4.tcp_rfc1337":                       "0",
+        "net.ipv4.tcp_fin_timeout":                   "60",
+        "net.ipv4.tcp_keepalive_time":                "7200",
+        "net.ipv4.tcp_keepalive_probes":              "9",
+        "net.ipv4.tcp_keepalive_intvl":               "75",
+    }
+    for key, val in restore_map.items():
+        run(f"sysctl -w {key}={val}", check=False, capture=True)
+    log("INFO", "sysctl settings restored to defaults.")
 
 # ─── Main CLI Commands ────────────────────────────────────────────────────────
 
@@ -918,6 +941,9 @@ def cmd_blacklist_add(args):
 def cmd_blacklist_remove(args):
     require_root()
     ip = args.ip
+    if not validate_ip(ip):
+        log("ERROR", f"Invalid IP address: {ip}")
+        sys.exit(1)
     if BLACKLIST_FILE.exists():
         lines = [l for l in BLACKLIST_FILE.read_text().splitlines() if l.strip() != ip]
         BLACKLIST_FILE.write_text("\n".join(lines) + "\n")
@@ -1047,10 +1073,10 @@ class Monitor:
             t1 = time.time()
             dt = t1 - t0 or 1
 
-            rx_bps = (rx_b1 - rx_b0) / dt
-            tx_bps = (tx_b1 - tx_b0) / dt
-            rx_pps = (rx_p1 - rx_p0) / dt
-            tx_pps = (tx_p1 - tx_p0) / dt
+            rx_bps = max(0, rx_b1 - rx_b0) / dt
+            tx_bps = max(0, tx_b1 - tx_b0) / dt
+            rx_pps = max(0, rx_p1 - rx_p0) / dt
+            tx_pps = max(0, tx_p1 - tx_p0) / dt
 
             rx_b0, rx_p0, tx_b0, tx_p0 = rx_b1, rx_p1, tx_b1, tx_p1
             t0 = t1
